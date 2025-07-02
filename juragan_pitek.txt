@@ -1,0 +1,1850 @@
+import React, { useState, useEffect, createContext, useContext } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from 'firebase/auth';
+import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, getDocs } from 'firebase/firestore';
+
+// Pastikan Tailwind CSS dimuat
+// <script src="https://cdn.tailwindcss.com"></script>
+
+// Konteks untuk Firebase dan informasi pengguna
+const AppContext = createContext(null);
+
+// Komponen utama aplikasi
+const App = () => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [userRole, setUserRole] = useState('loading'); // Peran default
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [currentDashboard, setCurrentDashboard] = useState('owner'); // Dasbor default
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false); // State untuk sidebar
+  const [isLoggedIn, setIsLoggedIn] = useState(false); // State untuk status login
+
+  // Inisialisasi Firebase dan autentikasi
+  useEffect(() => {
+    const initFirebase = async () => {
+      try {
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+
+        if (!Object.keys(firebaseConfig).length) {
+          throw new Error("Firebase config not found. Please ensure __firebase_config is defined.");
+        }
+
+        const app = initializeApp(firebaseConfig);
+        const firestoreDb = getFirestore(app);
+        const firebaseAuth = getAuth(app);
+
+        setDb(firestoreDb);
+        setAuth(firebaseAuth);
+
+        // Langganan perubahan status autentikasi
+        const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+          if (user) {
+            setUserId(user.uid);
+            setIsLoggedIn(true); // Set logged in
+            // Dapatkan peran pengguna dari Firestore
+            const userDocRef = doc(firestoreDb, `artifacts/${appId}/users/${user.uid}/profile/data`);
+            const userDocSnap = await getDoc(userDocRef);
+            let role = 'guest'; // Default to guest initially
+            let userName = `User-${user.uid.substring(0, 5)}`;
+
+            if (userDocSnap.exists()) {
+              role = userDocSnap.data().role || 'guest';
+              userName = userDocSnap.data().name || userName;
+            } else {
+              // For a brand new anonymous user, they are 'guest' until they "login" via the form
+              await setDoc(userDocRef, { name: userName, role: 'guest' });
+            }
+            setUserRole(role);
+
+            // Juga perbarui data publik karyawan
+            const publicUserDocRef = doc(firestoreDb, `artifacts/${appId}/public/data/users_public_data`, user.uid);
+            await setDoc(publicUserDocRef, {
+              id: user.uid,
+              name: userName,
+              role: role
+            }, { merge: true });
+
+          } else {
+            setUserId(null);
+            setUserRole('guest');
+            setIsLoggedIn(false); // Set logged out
+          }
+          setIsAuthReady(true);
+          setLoading(false);
+        });
+
+        // Autentikasi dengan token kustom atau anonim
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(firebaseAuth, __initial_auth_token);
+        } else {
+          await signInAnonymously(firebaseAuth);
+        }
+
+        return () => unsubscribe(); // Bersihkan langganan saat komponen dilepas
+      } catch (err) {
+        console.error("Kesalahan inisialisasi Firebase:", err);
+        setError("Gagal memuat aplikasi. Silakan coba lagi.");
+        setLoading(false);
+      }
+    };
+
+    initFirebase();
+  }, []);
+
+  const handleLogin = async (displayName, role) => {
+    if (!auth || !db || !userId) return; // Ensure Firebase is initialized and user is anonymously authenticated
+
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    const userDocRef = doc(db, `artifacts/${appId}/users/${userId}/profile/data`);
+    const publicUserDocRef = doc(db, `artifacts/${appId}/public/data/users_public_data`, userId);
+
+    try {
+      await updateDoc(userDocRef, { name: displayName, role: role });
+      await updateDoc(publicUserDocRef, { name: displayName, role: role });
+      setUserRole(role); // Update local state
+      setIsLoggedIn(true); // Mark as logged in
+      setCurrentDashboard(role === 'guest' ? 'owner' : role); // Redirect to owner or selected role dashboard
+    } catch (err) {
+      console.error("Error setting user role:", err);
+      setError("Gagal mengatur peran pengguna. Silakan coba lagi.");
+    }
+  };
+
+  const handleLogout = async () => {
+    if (auth) {
+      try {
+        await signOut(auth);
+        // Firebase onAuthStateChanged listener will handle resetting userId, userRole, isLoggedIn
+        setCurrentDashboard('owner'); // Reset to default dashboard view
+      } catch (err) {
+        console.error("Error signing out:", err);
+        setError("Gagal keluar. Silakan coba lagi.");
+      }
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-100">
+        <div className="text-xl font-semibold text-gray-700">Memuat Aplikasi...</div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-red-100 text-red-700 p-4 rounded-lg">
+        {error}
+      </div>
+    );
+  }
+
+  return (
+    <AppContext.Provider value={{ db, auth, userId, userRole, isAuthReady }}>
+      <div className="min-h-screen bg-gray-100 font-sans text-gray-800 flex">
+        {!isLoggedIn || userRole === 'guest' ? (
+          <LoginScreen onLogin={handleLogin} />
+        ) : (
+          <>
+            {/* Sidebar */}
+            <SideBar
+              isSidebarOpen={isSidebarOpen}
+              setIsSidebarOpen={setIsSidebarOpen}
+              currentDashboard={currentDashboard}
+              setCurrentDashboard={setCurrentDashboard}
+              userRole={userRole}
+            />
+
+            {/* Main Content Area */}
+            <div className="flex-1 flex flex-col">
+              <Header setIsSidebarOpen={setIsSidebarOpen} onLogout={handleLogout} />
+              <MainContent currentDashboard={currentDashboard} />
+            </div>
+          </>
+        )}
+      </div>
+    </AppContext.Provider>
+  );
+};
+
+// Komponen Login Screen
+const LoginScreen = ({ onLogin }) => {
+  const [displayName, setDisplayName] = useState('');
+  const [selectedRole, setSelectedRole] = useState('owner'); // Default to owner for easy testing
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    onLogin(displayName, selectedRole);
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-500 to-purple-600 w-full">
+      <div className="bg-white p-8 rounded-xl shadow-2xl w-96">
+        <div className="flex justify-center mb-6">
+          <img src="https://placehold.co/80x80/FF7F00/FFFFFF?text=JP" alt="Juragan Potek Logo" className="h-20 w-20 rounded-full" onError={(e) => { e.target.onerror = null; e.target.src='https://placehold.co/80x80/FF7F00/FFFFFF?text=JP'; }} />
+        </div>
+        <h2 className="text-3xl font-bold text-center text-gray-800 mb-6">Login Juragan Potek App</h2>
+        <form onSubmit={handleSubmit}>
+          <div className="mb-4">
+            <label htmlFor="displayName" className="block text-sm font-medium text-gray-700 mb-1">Nama Tampilan</label>
+            <input
+              type="text"
+              id="displayName"
+              className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              placeholder="Masukkan nama Anda"
+              required
+            />
+          </div>
+          <div className="mb-6">
+            <label htmlFor="roleSelect" className="block text-sm font-medium text-gray-700 mb-1">Pilih Peran</label>
+            <select
+              id="roleSelect"
+              className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
+              value={selectedRole}
+              onChange={(e) => setSelectedRole(e.target.value)}
+            >
+              <option value="owner">Owner</option>
+              <option value="marketing">Marketing</option>
+              <option value="pemotong">Pemotong</option>
+              <option value="kurir">Kurir</option>
+            </select>
+          </div>
+          <button
+            type="submit"
+            className="w-full bg-blue-600 text-white p-3 rounded-lg font-semibold hover:bg-blue-700 transition-colors duration-300 shadow-md"
+          >
+            Masuk
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+// Komponen Header
+const Header = ({ setIsSidebarOpen, onLogout }) => {
+  const { userId, userRole } = useContext(AppContext);
+
+  return (
+    <header className="bg-gradient-to-r from-blue-600 to-blue-800 text-white p-4 shadow-md rounded-b-lg flex items-center justify-between">
+      <button
+        onClick={() => setIsSidebarOpen(true)}
+        className="text-white focus:outline-none focus:ring-2 focus:ring-blue-300 rounded-md p-2 lg:hidden"
+      >
+        {/* Hamburger Icon */}
+        <svg
+          className="w-6 h-6"
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+          xmlns="http://www.w3.org/2000/svg"
+        >
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth="2"
+            d="M4 6h16M4 12h16M4 18h16"
+          ></path>
+        </svg>
+      </button>
+      <div className="flex items-center justify-center flex-1 lg:justify-start"> {/* Centered on small, left on large */}
+        <img src="https://placehold.co/40x40/FF7F00/FFFFFF?text=JP" alt="Juragan Potek Logo" className="h-10 w-10 mr-3 rounded-full" onError={(e) => { e.target.onerror = null; e.target.src='https://placehold.co/40x40/FF7F00/FFFFFF?text=JP'; }} />
+        <h1 className="text-3xl font-bold tracking-wide">JURAGAN PITEK APPS</h1>
+      </div>
+      <div className="flex items-center space-x-4">
+        <div className="text-right hidden lg:block"> {/* Hide on small screens */}
+          <p className="text-sm">ID Pengguna: <span className="font-mono bg-blue-700 px-2 py-1 rounded-md text-xs">{userId || 'N/A'}</span></p>
+          <p className="text-sm">Peran: <span className="font-semibold capitalize">{userRole}</span></p>
+        </div>
+        <button
+          onClick={onLogout}
+          className="bg-red-500 text-white py-2 px-4 rounded-full text-sm font-semibold hover:bg-red-600 transition-colors duration-300 shadow-md"
+        >
+          Logout
+        </button>
+      </div>
+    </header>
+  );
+};
+
+// Komponen Sidebar
+const SideBar = ({ isSidebarOpen, setIsSidebarOpen, currentDashboard, setCurrentDashboard, userRole }) => {
+  const navItems = [
+    { name: 'Owner', key: 'owner', roles: ['owner'] },
+    { name: 'Pemesanan (Marketing)', key: 'marketing', roles: ['owner', 'marketing'] },
+    { name: 'Prosesing (Pemotongan)', key: 'pemotong', roles: ['owner', 'pemotong'] },
+    { name: 'Kurir', key: 'kurir', roles: ['owner', 'kurir'] },
+    { name: 'Manajemen Produk', key: 'product-management', roles: ['owner'] },
+    { name: 'Manajemen Pelanggan', key: 'customer-management', roles: ['owner'] },
+  ];
+
+  return (
+    <>
+      {/* Overlay for mobile */}
+      {isSidebarOpen && (
+        <div
+          className="fixed inset-0 bg-black bg-opacity-50 z-40 lg:hidden"
+          onClick={() => setIsSidebarOpen(false)}
+        ></div>
+      )}
+
+      <aside
+        className={`fixed inset-y-0 left-0 w-64 bg-white shadow-lg transform ${
+          isSidebarOpen ? 'translate-x-0' : '-translate-x-full'
+        } lg:relative lg:translate-x-0 transition-transform duration-300 ease-in-out z-50 flex flex-col`}
+      >
+        <div className="p-4 border-b border-gray-200 flex justify-between items-center">
+          <h2 className="text-2xl font-bold text-blue-700">Menu</h2>
+          <button
+            onClick={() => setIsSidebarOpen(false)}
+            className="text-gray-600 hover:text-gray-800 focus:outline-none lg:hidden"
+          >
+            {/* Close Icon */}
+            <svg
+              className="w-6 h-6"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="2"
+                d="M6 18L18 6M6 6l12 12"
+              ></path>
+            </svg>
+          </button>
+        </div>
+        <nav className="flex-1 p-4 overflow-y-auto">
+          <ul>
+            {navItems.map((item) => (
+              <li key={item.key} className="mb-2">
+                <button
+                  onClick={() => {
+                    setCurrentDashboard(item.key);
+                    setIsSidebarOpen(false); // Close sidebar on item click
+                  }}
+                  className={`block w-full text-left py-2 px-4 rounded-md font-semibold transition-colors duration-200
+                    ${currentDashboard === item.key ? 'bg-blue-600 text-white shadow-md' : 'text-gray-700 hover:bg-blue-100 hover:text-blue-800'}
+                    ${!item.roles.includes(userRole) && userRole !== 'owner' ? 'opacity-50 cursor-not-allowed' : ''}
+                  `}
+                  disabled={!item.roles.includes(userRole) && userRole !== 'owner'}
+                >
+                  {item.name}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </nav>
+      </aside>
+    </>
+  );
+};
+
+// Komponen Konten Utama (Menampilkan dasbor berdasarkan peran)
+const MainContent = ({ currentDashboard }) => {
+  const { userRole, isAuthReady } = useContext(AppContext);
+
+  if (!isAuthReady) {
+    return (
+      <div className="p-8 text-center text-gray-600">Memuat...</div>
+    );
+  }
+
+  // Render dashboard based on currentDashboard state
+  switch (currentDashboard) {
+    case 'owner':
+      return <OwnerDashboard />;
+    case 'marketing':
+      return <MarketingDashboard />;
+    case 'pemotong':
+      return <ProcessingDashboard />;
+    case 'kurir':
+      return <CourierDashboard />;
+    case 'product-management':
+      return <ProductManagementDashboard />;
+    case 'customer-management':
+      return <CustomerManagementDashboard />;
+    default:
+      return (
+        <div className="text-center p-8 bg-white rounded-lg shadow-md">
+          <h2 className="text-2xl font-bold text-red-600 mb-4">Dasbor Tidak Ditemukan</h2>
+          <p className="text-gray-700">Dasbor yang diminta tidak tersedia.</p>
+        </div>
+      );
+  }
+};
+
+// --- Komponen Dasbor ---
+
+// Komponen Manajemen Pelanggan (Dasbor Terpisah)
+const CustomerManagementDashboard = () => {
+  const { db, userId } = useContext(AppContext);
+  const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+  const [customers, setCustomers] = useState([]);
+  const [message, setMessage] = useState('');
+  const [newCustomerName, setNewCustomerName] = useState('');
+  const [newCustomerAddress, setNewCustomerAddress] = useState('');
+  const [newCustomerPhone, setNewCustomerPhone] = useState('');
+
+  useEffect(() => {
+    if (!db || !userId) return;
+
+    const customersRef = collection(db, `artifacts/${appId}/public/data/customers`);
+    const unsubscribe = onSnapshot(customersRef, (snapshot) => {
+      const fetchedCustomers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setCustomers(fetchedCustomers);
+    }, (error) => console.error("Error fetching customers:", error));
+
+    return () => unsubscribe();
+  }, [db, userId, appId]);
+
+  const handleAddCustomer = async (e) => {
+    e.preventDefault();
+    if (!newCustomerName || !newCustomerAddress || !newCustomerPhone) {
+      setMessage('Semua bidang pelanggan baru harus diisi.');
+      return;
+    }
+    try {
+      const customersCollectionRef = collection(db, `artifacts/${appId}/public/data/customers`);
+      await addDoc(customersCollectionRef, {
+        customerName: newCustomerName,
+        customerAddress: newCustomerAddress,
+        customerPhone: newCustomerPhone,
+        rewardPoints: 0,
+        createdAt: Date.now()
+      });
+      setMessage('Pelanggan baru berhasil ditambahkan!');
+      setNewCustomerName('');
+      setNewCustomerAddress('');
+      setNewCustomerPhone('');
+    } catch (error) {
+      console.error("Error adding new customer:", error);
+      setMessage('Gagal menambahkan pelanggan baru.');
+    }
+  };
+
+  return (
+    <div className="bg-white p-6 rounded-xl shadow-lg m-4"> {/* Added margin */}
+      <h2 className="text-3xl font-bold text-blue-700 mb-6 border-b-2 pb-2 border-blue-200">Dasbor Manajemen Pelanggan</h2>
+
+      {message && (
+        <div className="bg-blue-100 text-blue-800 p-3 rounded-md mb-4 text-center">
+          {message}
+        </div>
+      )}
+
+      <div className="mb-8 p-6 bg-gray-50 rounded-lg shadow-inner">
+        <h3 className="text-2xl font-semibold text-gray-700 mb-4">Tambah Pelanggan Baru</h3>
+        <form onSubmit={handleAddCustomer} className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+          <div>
+            <label htmlFor="newCustomerName" className="block text-sm font-medium text-gray-700">Nama Pelanggan</label>
+            <input type="text" id="newCustomerName" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2" value={newCustomerName} onChange={(e) => setNewCustomerName(e.target.value)} required />
+          </div>
+          <div>
+            <label htmlFor="newCustomerAddress" className="block text-sm font-medium text-gray-700">Alamat Pelanggan</label>
+            <textarea id="newCustomerAddress" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2" value={newCustomerAddress} onChange={(e) => setNewCustomerAddress(e.target.value)} required rows="1"></textarea>
+          </div>
+          <div>
+            <label htmlFor="newCustomerPhone" className="block text-sm font-medium text-gray-700">Nomor WhatsApp</label>
+            <input type="tel" id="newCustomerPhone" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2" value={newCustomerPhone} onChange={(e) => setNewCustomerPhone(e.target.value)} required />
+          </div>
+          <div className="md:col-span-3 flex justify-end">
+            <button type="submit" className="bg-green-500 text-white py-2 px-6 rounded-full hover:bg-green-600 transition-colors duration-300 shadow-md">
+              Tambah Pelanggan
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <h3 className="text-2xl font-semibold text-gray-700 mb-4">Daftar Pelanggan & Poin Reward</h3>
+      <div className="overflow-x-auto">
+        <table className="min-w-full bg-white rounded-lg overflow-hidden shadow-md">
+          <thead className="bg-gray-100 border-b border-gray-200"><tr>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Nama Pelanggan</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Alamat</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Nomor WA</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Poin Reward</th>
+          </tr></thead>
+          <tbody>
+            {customers.length === 0 ? (<tr>
+              <td colSpan="4" className="text-center py-4 text-gray-500">Tidak ada pelanggan.</td>
+            </tr>) : (
+              customers.map(customer => (
+                <tr key={customer.id} className="border-b border-gray-100 hover:bg-gray-50">
+                  <td className="py-3 px-4 text-sm font-medium">{customer.customerName}</td>
+                  <td className="py-3 px-4 text-sm">{customer.customerAddress || 'N/A'}</td>
+                  <td className="py-3 px-4 text-sm">{customer.customerPhone || 'N/A'}</td>
+                  <td className="py-3 px-4 text-sm font-bold text-green-700">{customer.rewardPoints || 0}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+// Komponen Manajemen Produk (Dasbor Terpisah)
+const ProductManagementDashboard = () => {
+  const { db, userId } = useContext(AppContext);
+  const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+  const [products, setProducts] = useState([]);
+  const [message, setMessage] = useState('');
+
+  useEffect(() => {
+    if (!db || !userId) return;
+
+    const productsRef = collection(db, `artifacts/${appId}/public/data/products`);
+    const unsubscribeProducts = onSnapshot(productsRef, (snapshot) => {
+      const fetchedProducts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setProducts(fetchedProducts);
+    }, (error) => console.error("Error fetching products:", error));
+
+    return () => unsubscribeProducts();
+  }, [db, userId, appId]);
+
+  const handleUpdateProductPrice = async (productId, newPrice) => {
+    if (!db || !productId || newPrice === '' || isNaN(newPrice) || newPrice < 0) {
+      setMessage('Harga baru tidak valid.');
+      return;
+    }
+    try {
+      const productDocRef = doc(db, `artifacts/${appId}/public/data/products`, productId);
+      // Recalculate rewardPerUnit if price changes
+      const updatedRewardPerUnit = Math.floor(parseFloat(newPrice) / 10000);
+      await updateDoc(productDocRef, { price: parseFloat(newPrice), rewardPerUnit: updatedRewardPerUnit });
+      setMessage('Harga produk berhasil diperbarui!');
+    } catch (error) {
+      console.error("Error updating product price:", error);
+      setMessage('Gagal memperbarui harga produk.');
+    }
+  };
+
+  const handleAddProduct = async (e) => {
+    e.preventDefault();
+    const productName = e.target.productName.value;
+    const productPrice = parseFloat(e.target.productPrice.value);
+    const productStock = parseInt(e.target.productStock.value, 10);
+    const productUnit = e.target.productUnit.value;
+
+    if (!productName || isNaN(productPrice) || productPrice <= 0 || isNaN(productStock) || productStock < 0 || !productUnit) {
+      setMessage('Semua bidang produk harus diisi dengan nilai yang valid.');
+      return;
+    }
+
+    try {
+      const productsCollectionRef = collection(db, `artifacts/${appId}/public/data/products`);
+      await addDoc(productsCollectionRef, {
+        name: productName,
+        price: productPrice,
+        stock: productStock,
+        unit: productUnit,
+        rewardPerUnit: Math.floor(productPrice / 10000), // Calculate and store reward per unit
+        createdAt: Date.now(),
+      });
+      setMessage('Produk berhasil ditambahkan!');
+      e.target.reset();
+    } catch (error) {
+      console.error("Error adding product:", error);
+      setMessage('Gagal menambahkan produk.');
+    }
+  };
+
+  const handleDeleteProduct = async (productId) => {
+    if (window.confirm('Apakah Anda yakin ingin menghapus produk ini?')) {
+      try {
+        const productDocRef = doc(db, `artifacts/${appId}/public/data/products`, productId);
+        await deleteDoc(productDocRef);
+        setMessage('Produk berhasil dihapus!');
+      } catch (error) {
+        console.error("Error deleting product:", error);
+        setMessage('Gagal menghapus produk.');
+      }
+    }
+  };
+
+  return (
+    <div className="bg-white p-6 rounded-xl shadow-lg m-4"> {/* Added margin */}
+      <h2 className="text-3xl font-bold text-blue-700 mb-6 border-b-2 pb-2 border-blue-200">Dasbor Manajemen Produk</h2>
+
+      {message && (
+        <div className="bg-blue-100 text-blue-800 p-3 rounded-md mb-4 text-center">
+          {message}
+        </div>
+      )}
+
+      <div className="mb-8 p-6 bg-gray-50 rounded-lg shadow-inner">
+        <h3 className="text-2xl font-semibold text-gray-700 mb-4">Tambah Produk Baru</h3>
+        <form onSubmit={handleAddProduct} className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+          <div>
+            <label htmlFor="productName" className="block text-sm font-medium text-gray-700">Nama Produk</label>
+            <input type="text" id="productName" name="productName" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2" required />
+          </div>
+          <div>
+            <label htmlFor="productPrice" className="block text-sm font-medium text-gray-700">Harga Produk (Rp)</label>
+            <input type="number" id="productPrice" name="productPrice" step="0.01" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2" required />
+          </div>
+          <div>
+            <label htmlFor="productStock" className="block text-sm font-medium text-gray-700">Stok Barang</label>
+            <input type="number" id="productStock" name="productStock" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2" required />
+          </div>
+          <div>
+            <label htmlFor="productUnit" className="block text-sm font-medium text-gray-700">Satuan</label>
+            <input type="text" id="productUnit" name="productUnit" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2" placeholder="pcs, kg, meter" required />
+          </div>
+          <div className="md:col-span-4 flex justify-end">
+            <button type="submit" className="bg-green-500 text-white py-2 px-6 rounded-full hover:bg-green-600 transition-colors duration-300 shadow-md">
+              Tambah Produk
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <h4 className="text-xl font-semibold text-gray-600 mb-3">Daftar Produk & Ubah Harga</h4>
+      <div className="overflow-x-auto">
+        <table className="min-w-full bg-white rounded-lg overflow-hidden shadow-md">
+          <thead className="bg-gray-100 border-b border-gray-200"><tr>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Nama Produk</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Harga Pelanggan (Rp)</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Stok</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Satuan</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Poin per Unit (Estimasi)</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Aksi</th>
+          </tr></thead>
+          <tbody>
+            {products.length === 0 ? (<tr>
+              <td colSpan="6" className="text-center py-4 text-gray-500">Tidak ada produk.</td>
+            </tr>) : (
+              products.map(product => (
+                <tr key={product.id} className="border-b border-gray-100 hover:bg-gray-50">
+                  <td className="py-3 px-4 text-sm font-medium">{product.name}</td>
+                  <td className="py-3 px-4 text-sm">
+                    <input
+                      type="number"
+                      defaultValue={product.price}
+                      onBlur={(e) => handleUpdateProductPrice(product.id, e.target.value)}
+                      className="w-24 rounded-md border-gray-300 shadow-sm p-1 text-sm"
+                    />
+                  </td>
+                  <td className="py-3 px-4 text-sm">{product.stock}</td>
+                  <td className="py-3 px-4 text-sm">{product.unit || 'N/A'}</td>
+                  <td className="py-3 px-4 text-sm">
+                    {product.rewardPerUnit || 0} {/* Display stored rewardPerUnit */}
+                  </td>
+                  <td className="py-3 px-4 text-sm">
+                    <button
+                      onClick={() => handleDeleteProduct(product.id)}
+                      className="bg-red-500 text-white py-1 px-3 rounded-full text-xs hover:bg-red-600 transition-colors duration-300"
+                    >
+                      Hapus
+                    </button>
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+
+// Dasbor Owner
+const OwnerDashboard = () => {
+  const { db, userId } = useContext(AppContext);
+  const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+  const [orders, setOrders] = useState([]);
+  const [users, setUsers] = useState([]); // Now fetches from public_data
+  const [activeTab, setActiveTab] = useState('overview'); // 'overview', 'employees', 'finance'
+  const [message, setMessage] = useState(''); // State for messages in Owner Dashboard
+
+  useEffect(() => {
+    if (!db || !userId) return;
+
+    // Langganan pesanan
+    const ordersRef = collection(db, `artifacts/${appId}/public/data/orders`);
+    const unsubscribeOrders = onSnapshot(ordersRef, (snapshot) => {
+      const fetchedOrders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setOrders(fetchedOrders);
+    }, (error) => console.error("Error fetching orders:", error));
+
+    // Langganan pengguna (karyawan) dari koleksi publik
+    const usersPublicDataRef = collection(db, `artifacts/${appId}/public/data/users_public_data`);
+    const unsubscribeUsers = onSnapshot(usersPublicDataRef, (snapshot) => {
+      const fetchedUsers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setUsers(fetchedUsers);
+    }, (error) => console.error("Error fetching users from public data:", error));
+
+    return () => {
+      unsubscribeOrders();
+      unsubscribeUsers();
+    };
+  }, [db, userId, appId]);
+
+  // Perhitungan keuangan sederhana
+  const totalSales = orders.filter(o => o.status === 'Di Terima').reduce((sum, order) => sum + order.totalPrice, 0);
+  const totalProcessing = orders.filter(o => o.status === 'Di Proses').length;
+  const totalShipped = orders.filter(o => o.status === 'Di Kirim').length;
+  const totalPending = orders.filter(o => o.status === 'Di Pesan').length;
+
+  return (
+    <div className="bg-white p-6 rounded-xl shadow-lg m-4"> {/* Added margin */}
+      <h2 className="text-3xl font-bold text-blue-700 mb-6 border-b-2 pb-2 border-blue-200">Dasbor Owner</h2>
+
+      <div className="flex space-x-4 mb-6">
+        <button
+          onClick={() => setActiveTab('overview')}
+          className={`py-2 px-6 rounded-full font-semibold transition-all duration-300 ${activeTab === 'overview' ? 'bg-blue-600 text-white shadow-md' : 'bg-gray-200 text-gray-700 hover:bg-blue-100'}`}
+        >
+          Gambaran Umum Pesanan
+        </button>
+        <button
+          onClick={() => setActiveTab('finance')}
+          className={`py-2 px-6 rounded-full font-semibold transition-all duration-300 ${activeTab === 'finance' ? 'bg-blue-600 text-white shadow-md' : 'bg-gray-200 text-gray-700 hover:bg-blue-100'}`}
+        >
+          Laporan Keuangan
+        </button>
+        <button
+          onClick={() => setActiveTab('employees')}
+          className={`py-2 px-6 rounded-full font-semibold transition-all duration-300 ${activeTab === 'employees' ? 'bg-blue-600 text-white shadow-md' : 'bg-gray-200 text-gray-700 hover:bg-blue-100'}`}
+        >
+          Manajemen Karyawan
+        </button>
+      </div>
+
+      {message && (
+        <div className="bg-blue-100 text-blue-800 p-3 rounded-md mb-4 text-center">
+          {message}
+        </div>
+      )}
+
+      {activeTab === 'overview' && (
+        <div>
+          <h3 className="text-2xl font-semibold text-gray-700 mb-4">Status Pesanan Sekilas</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+            <div className="bg-blue-50 p-5 rounded-lg shadow-sm border border-blue-200">
+              <p className="text-sm text-blue-600">Total Pesanan Dipesan</p>
+              <p className="text-3xl font-bold text-blue-800">{totalPending}</p>
+            </div>
+            <div className="bg-yellow-50 p-5 rounded-lg shadow-sm border border-yellow-200">
+              <p className="text-sm text-yellow-600">Total Pesanan Diproses</p>
+              <p className="text-3xl font-bold text-yellow-800">{totalProcessing}</p>
+            </div>
+            <div className="bg-green-50 p-5 rounded-lg shadow-sm border border-green-200">
+              <p className="text-sm text-green-600">Total Pesanan Dikirim</p>
+              <p className="text-3xl font-bold text-green-800">{totalShipped}</p>
+            </div>
+            <div className="bg-purple-50 p-5 rounded-lg shadow-sm border border-purple-200">
+              <p className="text-sm text-purple-600">Total Pesanan Diterima</p>
+              <p className="text-3xl font-bold text-purple-800">{orders.filter(o => o.status === 'Di Terima').length}</p>
+            </div>
+          </div>
+
+          <h3 className="text-2xl font-semibold text-gray-700 mb-4">Detail Semua Pesanan</h3>
+          <div className="overflow-x-auto">
+            <table className="min-w-full bg-white rounded-lg overflow-hidden shadow-md">
+              <thead className="bg-gray-100 border-b border-gray-200"><tr>
+                <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">ID Pesanan</th>
+                <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Pelanggan</th>
+                <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Total Harga</th>
+                <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Status</th>
+                <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Kurir</th>
+                <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Tanggal</th>
+              </tr></thead>
+              <tbody>
+                {orders.length === 0 ? (<tr>
+                  <td colSpan="6" className="text-center py-4 text-gray-500">Tidak ada pesanan.</td>
+                </tr>) : (
+                  orders.map(order => (
+                    <tr key={order.id} className="border-b border-gray-100 hover:bg-gray-50">
+                      <td className="py-3 px-4 text-sm">{order.id.substring(0, 8)}...</td>
+                      <td className="py-3 px-4 text-sm font-medium">{order.customerName}</td>
+                      <td className="py-3 px-4 text-sm">Rp {order.totalPrice.toLocaleString('id-ID')}</td>
+                      <td className="py-3 px-4 text-sm">
+                        <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
+                          order.status === 'Di Pesan' ? 'bg-blue-100 text-blue-800' :
+                          order.status === 'Di Proses' ? 'bg-yellow-100 text-yellow-800' :
+                          order.status === 'Siap Kirim' ? 'bg-purple-100 text-purple-800' :
+                          order.status === 'Di Kirim' ? 'bg-green-100 text-green-800' :
+                          'bg-gray-100 text-gray-800'
+                        }`}>
+                          {order.status}
+                        </span>
+                      </td>
+                      {/* Menggunakan daftar pengguna yang diambil dari public_data */}
+                      <td className="py-3 px-4 text-sm">{users.find(u => u.id === order.assignedCourierId)?.name || 'Belum Ditugaskan'}</td>
+                      <td className="py-3 px-4 text-sm">{new Date(order.createdAt).toLocaleDateString('id-ID')}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'finance' && (
+        <div className="bg-white p-6 rounded-xl shadow-lg">
+          <h3 className="text-2xl font-semibold text-gray-700 mb-4">Laporan Keuangan</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="bg-green-50 p-5 rounded-lg shadow-sm border border-green-200">
+              <p className="text-sm text-green-600">Total Penjualan (Diterima)</p>
+              <p className="text-3xl font-bold text-green-800">Rp {totalSales.toLocaleString('id-ID')}</p>
+            </div>
+            <div className="bg-red-50 p-5 rounded-lg shadow-sm border border-red-200">
+              <p className="text-sm text-red-600">Total Pengeluaran (Estimasi)</p>
+              <p className="text-3xl font-bold text-red-800">Rp {(totalSales * 0.3).toLocaleString('id-ID')}</p> {/* Placeholder for expenses */}
+            </div>
+            <div className="bg-blue-50 p-5 rounded-lg shadow-sm border border-blue-200">
+              <p className="text-sm text-blue-600">Omzet (Estimasi)</p>
+              <p className="text-3xl font-bold text-blue-800">Rp {totalSales.toLocaleString('id-ID')}</p>
+            </div>
+            <div className="bg-purple-50 p-5 rounded-lg shadow-sm border border-purple-200">
+              <p className="text-sm text-purple-600">Laba Rugi (Estimasi)</p>
+              <p className="text-3xl font-bold text-purple-800">Rp {(totalSales * 0.7).toLocaleString('id-ID')}</p> {/* Placeholder for profit */}
+            </div>
+          </div>
+          <p className="text-sm text-gray-500 mt-4">Catatan: Angka pengeluaran dan laba rugi adalah estimasi sederhana. Untuk laporan yang akurat, perlu sistem pencatatan pengeluaran yang lebih detail.</p>
+        </div>
+      )}
+
+      {activeTab === 'employees' && (
+        <EmployeeManagement users={users} />
+      )}
+    </div>
+  );
+};
+
+// Komponen Pembuatan Pesanan
+const OrderCreationSection = ({ products, db, appId, setMessage, customers }) => { // Added customers prop
+  const { userId } = useContext(AppContext);
+  const [selectedCustomerId, setSelectedCustomerId] = useState(''); // Stores customer ID if selected
+  const [customerName, setCustomerName] = useState('');
+  const [customerAddress, setCustomerAddress] = useState('');
+  const [customerPhone, setCustomerPhone] = useState('');
+  const [showNewCustomerForm, setShowNewCustomerForm] = useState(false); // Toggle for new customer form
+  const [orderNotes, setOrderNotes] = useState(''); // New state for order notes
+
+  const [selectedProduct, setSelectedProduct] = useState('');
+  const [quantity, setQuantity] = useState(1);
+  const [currentOrderItems, setCurrentOrderItems] = useState([]);
+
+  useEffect(() => {
+    // When a customer is selected from dropdown, populate fields
+    if (selectedCustomerId && selectedCustomerId !== 'new') {
+      const customer = customers.find(c => c.id === selectedCustomerId);
+      if (customer) {
+        setCustomerName(customer.customerName || '');
+        setCustomerAddress(customer.customerAddress || '');
+        setCustomerPhone(customer.customerPhone || '');
+        setShowNewCustomerForm(false);
+      }
+    } else if (selectedCustomerId === 'new') {
+      // Clear fields for new customer
+      setCustomerName('');
+      setCustomerAddress('');
+      setCustomerPhone('');
+      setShowNewCustomerForm(true);
+    } else {
+      // Clear all fields if no customer selected
+      setCustomerName('');
+      setCustomerAddress('');
+      setCustomerPhone('');
+      setShowNewCustomerForm(false);
+    }
+  }, [selectedCustomerId, customers]);
+
+
+  const handleAddProductToOrder = () => {
+    if (!selectedProduct || quantity <= 0) {
+      setMessage('Pilih produk dan masukkan jumlah yang valid.');
+      return;
+    }
+    const product = products.find(p => p.id === selectedProduct);
+    if (product) {
+      const existingItemIndex = currentOrderItems.findIndex(item => item.productId === product.id);
+      if (existingItemIndex > -1) {
+        const updatedItems = [...currentOrderItems];
+        updatedItems[existingItemIndex].quantity += quantity;
+        setCurrentOrderItems(updatedItems);
+      } else {
+        setCurrentOrderItems([...currentOrderItems, {
+          productId: product.id,
+          productName: product.name,
+          price: product.price,
+          quantity: quantity,
+          unit: product.unit || 'unit', // Include unit from product
+          rewardPerUnit: product.rewardPerUnit || 0 // Include reward per unit from product
+        }]);
+      }
+      setSelectedProduct('');
+      setQuantity(1);
+      setMessage('');
+    }
+  };
+
+  const handleRemoveItem = (index) => {
+    const updatedItems = currentOrderItems.filter((_, i) => i !== index);
+    setCurrentOrderItems(updatedItems);
+  };
+
+  const calculateTotalPrice = () => {
+    return currentOrderItems.reduce((total, item) => total + (item.price * item.quantity), 0);
+  };
+
+  const handleCreateOrder = async (e) => {
+    e.preventDefault();
+    if (!customerName || currentOrderItems.length === 0 || !customerAddress || !customerPhone) {
+      setMessage('Nama pelanggan, alamat, nomor WA, dan setidaknya satu item diperlukan untuk membuat pesanan.');
+      return;
+    }
+
+    let customerIdToUse = selectedCustomerId;
+    if (showNewCustomerForm) {
+      try {
+        // Add new customer to customers collection
+        const customersCollectionRef = collection(db, `artifacts/${appId}/public/data/customers`);
+        const newCustomerDocRef = await addDoc(customersCollectionRef, {
+          customerName,
+          customerAddress,
+          customerPhone,
+          rewardPoints: 0, // New customers start with 0 points
+          createdAt: Date.now()
+        });
+        customerIdToUse = newCustomerDocRef.id;
+        setMessage('Pelanggan baru berhasil ditambahkan!');
+      } catch (error) {
+        console.error("Error adding new customer:", error);
+        setMessage('Gagal menambahkan pelanggan baru.');
+        return; // Stop order creation if customer creation fails
+      }
+    }
+
+    try {
+      const ordersCollectionRef = collection(db, `artifacts/${appId}/public/data/orders`);
+      await addDoc(ordersCollectionRef, {
+        customerId: customerIdToUse, // Link order to customer ID
+        customerName,
+        customerAddress,
+        customerPhone,
+        items: currentOrderItems,
+        totalPrice: calculateTotalPrice(),
+        status: 'Di Pesan', // Initial status
+        assignedCourierId: null,
+        orderNotes: orderNotes, // Include order notes
+        createdAt: Date.now(), // Corrected typo: Date.2now() to Date.now()
+        updatedAt: Date.now(),
+      });
+      setMessage('Pesanan berhasil dibuat!');
+      setSelectedCustomerId('');
+      setCustomerName('');
+      setCustomerAddress('');
+      setCustomerPhone('');
+      setOrderNotes('');
+      setCurrentOrderItems([]);
+      setShowNewCustomerForm(false);
+    } catch (error) {
+      console.error("Error creating order:", error);
+      setMessage('Gagal membuat pesanan. Silakan coba lagi.');
+    }
+  };
+
+  return (
+    <div className="mb-8 p-6 bg-blue-50 rounded-lg shadow-inner">
+      <h3 className="text-2xl font-semibold text-blue-700 mb-4">Buat Pesanan Baru</h3>
+      <form onSubmit={handleCreateOrder}>
+        <div className="mb-4">
+          <label htmlFor="customerSelect" className="block text-sm font-medium text-gray-700">Pilih Pelanggan</label>
+          <select
+            id="customerSelect"
+            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"
+            value={selectedCustomerId}
+            onChange={(e) => setSelectedCustomerId(e.target.value)}
+          >
+            <option value="">-- Pilih Pelanggan --</option>
+            {customers.map(customer => (
+              <option key={customer.id} value={customer.id}>
+                {customer.customerName} ({customer.customerPhone})
+              </option>
+            ))}
+            <option value="new">-- Tambah Pelanggan Baru --</option>
+          </select>
+        </div>
+
+        {showNewCustomerForm && (
+          <>
+            <div className="mb-4">
+              <label htmlFor="newCustomerName" className="block text-sm font-medium text-gray-700">Nama Pelanggan Baru</label>
+              <input
+                type="text"
+                id="newCustomerName"
+                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"
+                value={customerName}
+                onChange={(e) => setCustomerName(e.target.value)}
+                required={showNewCustomerForm}
+              />
+            </div>
+            <div className="mb-4">
+              <label htmlFor="newCustomerAddress" className="block text-sm font-medium text-gray-700">Alamat Pelanggan Baru</label>
+              <textarea
+                id="newCustomerAddress"
+                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"
+                value={customerAddress}
+                onChange={(e) => setCustomerAddress(e.target.value)}
+                required={showNewCustomerForm}
+              ></textarea>
+            </div>
+            <div className="mb-4">
+              <label htmlFor="newCustomerPhone" className="block text-sm font-medium text-gray-700">Nomor WhatsApp Baru</label>
+              <input
+                type="tel"
+                id="newCustomerPhone"
+                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"
+                value={customerPhone}
+                onChange={(e) => setCustomerPhone(e.target.value)}
+                required={showNewCustomerForm}
+              />
+            </div>
+          </>
+        )}
+
+        {!showNewCustomerForm && selectedCustomerId !== 'new' && (
+          <>
+            <div className="mb-4">
+              <label htmlFor="customerAddressDisplay" className="block text-sm font-medium text-gray-700">Alamat Pelanggan</label>
+              <input
+                type="text"
+                id="customerAddressDisplay"
+                className="mt-1 block w-full rounded-md border-gray-300 bg-gray-100 shadow-sm p-2"
+                value={customerAddress}
+                readOnly
+              />
+            </div>
+            <div className="mb-4">
+              <label htmlFor="customerPhoneDisplay" className="block text-sm font-medium text-gray-700">Nomor WhatsApp</label>
+              <input
+                type="tel"
+                id="customerPhoneDisplay"
+                className="mt-1 block w-full rounded-md border-gray-300 bg-gray-100 shadow-sm p-2"
+                value={customerPhone}
+                readOnly
+              />
+            </div>
+          </>
+        )}
+
+        <div className="mb-4">
+          <label htmlFor="orderNotes" className="block text-sm font-medium text-gray-700">Catatan Pemesanan</label>
+          <textarea
+            id="orderNotes"
+            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"
+            value={orderNotes}
+            onChange={(e) => setOrderNotes(e.target.value)}
+            rows="3"
+            placeholder="Tambahkan catatan penting untuk pesanan ini..."
+          ></textarea>
+        </div>
+
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+          <div>
+            <label htmlFor="productSelect" className="block text-sm font-medium text-gray-700">Jenis Produk</label>
+            <select
+              id="productSelect"
+              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"
+              value={selectedProduct}
+              onChange={(e) => setSelectedProduct(e.target.value)}
+            >
+              <option value="">Pilih Produk</option>
+              {products.map(product => (
+                <option key={product.id} value={product.id}>
+                  {product.name} (Rp {product.price.toLocaleString('id-ID')})
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label htmlFor="quantity" className="block text-sm font-medium text-gray-700">Jumlah Barang</label>
+            <input
+              type="number"
+              id="quantity"
+              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"
+              value={quantity}
+              onChange={(e) => setQuantity(e.target.value === '' ? '' : parseInt(e.target.value) || 0)}
+              min="1"
+            />
+          </div>
+          <div className="flex items-end">
+            <button
+              type="button"
+              onClick={handleAddProductToOrder}
+              className="bg-blue-500 text-white py-2 px-6 rounded-full hover:bg-blue-600 transition-colors duration-300 shadow-md w-full"
+            >
+              Tambah Item
+            </button>
+          </div>
+        </div>
+
+        <h4 className="text-xl font-semibold text-gray-700 mb-3">Item Pesanan</h4>
+        {currentOrderItems.length === 0 ? (
+          <p className="text-gray-500 mb-4">Belum ada item dalam pesanan ini.</p>
+        ) : (
+          <div className="bg-white rounded-lg shadow-sm p-4 mb-4">
+            {currentOrderItems.map((item, index) => (
+              <div key={index} className="flex justify-between items-center py-2 border-b last:border-b-0">
+                <p className="text-gray-800">{item.productName} x {item.quantity} {item.unit || 'unit'}</p> {/* Display unit */}
+                <div className="flex items-center space-x-4">
+                  <p className="font-semibold">Rp {(item.price * item.quantity).toLocaleString('id-ID')}</p>
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveItem(index)}
+                    className="text-red-500 hover:text-red-700 transition-colors duration-300"
+                  >
+                    Hapus
+                  </button>
+                </div>
+              </div>
+            ))}
+            <div className="flex justify-between items-center mt-4 pt-4 border-t-2 border-blue-200">
+              <p className="text-lg font-bold text-blue-800">Total Harga:</p>
+              <p className="text-xl font-bold text-blue-800">Rp {calculateTotalPrice().toLocaleString('id-ID')}</p>
+            </div>
+          </div>
+        )}
+
+        <div className="flex justify-end">
+          <button
+            type="submit"
+            className="bg-green-600 text-white py-3 px-8 rounded-full text-lg font-semibold hover:bg-green-700 transition-colors duration-300 shadow-lg"
+          >
+            Buat Pesanan
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+};
+
+// Dasbor Marketing
+const MarketingDashboard = () => {
+  const { db, userId } = useContext(AppContext);
+  const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+  const [products, setProducts] = useState([]);
+  const [orders, setOrders] = useState([]);
+  const [customers, setCustomers] = useState([]); // Fetch customers for marketing dashboard
+  const [message, setMessage] = useState('');
+
+  useEffect(() => {
+    if (!db || !userId) return;
+
+    // Langganan produk
+    const productsRef = collection(db, `artifacts/${appId}/public/data/products`);
+    const unsubscribeProducts = onSnapshot(productsRef, (snapshot) => {
+      const fetchedProducts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setProducts(fetchedProducts);
+    }, (error) => console.error("Error fetching products:", error));
+
+    // Langganan pesanan
+    const ordersRef = collection(db, `artifacts/${appId}/public/data/orders`);
+    const unsubscribeOrders = onSnapshot(ordersRef, (snapshot) => {
+      const fetchedOrders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setOrders(fetchedOrders);
+    }, (error) => console.error("Error fetching orders:", error));
+
+    // Langganan pelanggan
+    const customersRef = collection(db, `artifacts/${appId}/public/data/customers`);
+    const unsubscribeCustomers = onSnapshot(customersRef, (snapshot) => {
+      const fetchedCustomers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setCustomers(fetchedCustomers);
+    }, (error) => console.error("Error fetching customers:", error));
+
+    return () => {
+      unsubscribeProducts();
+      unsubscribeOrders();
+      unsubscribeCustomers();
+    };
+  }, [db, userId, appId]);
+
+  return (
+    <div className="bg-white p-6 rounded-xl shadow-lg m-4"> {/* Added margin */}
+      <h2 className="text-3xl font-bold text-blue-700 mb-6 border-b-2 pb-2 border-blue-200">Dasbor Pemesanan (Marketing)</h2>
+
+      {message && (
+        <div className="bg-blue-100 text-blue-800 p-3 rounded-md mb-4 text-center">
+          {message}
+        </div>
+      )}
+
+      {/* Bagian Pembuatan Pesanan */}
+      <OrderCreationSection
+        products={products}
+        db={db}
+        appId={appId}
+        setMessage={setMessage}
+        orders={orders}
+        customers={customers} // Pass customers to OrderCreationSection
+      />
+
+      {/* Daftar Pesanan Marketing (hanya pesanan yang dibuat oleh marketing ini) */}
+      <div className="p-6 bg-white rounded-xl shadow-lg">
+        <h3 className="text-2xl font-bold text-gray-700 mb-4">Pesanan Saya</h3>
+        <div className="overflow-x-auto">
+          <table className="min-w-full bg-white rounded-lg overflow-hidden shadow-md">
+            <thead className="bg-gray-100 border-b border-gray-200"><tr>
+              <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">ID Pesanan</th>
+              <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Pelanggan</th>
+              <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Total Harga</th>
+              <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Status</th>
+              <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Tanggal</th>
+            </tr></thead>
+            <tbody>
+              {orders.length === 0 ? (<tr>
+                <td colSpan="5" className="text-center py-4 text-gray-500">Tidak ada pesanan yang dibuat.</td>
+              </tr>) : (
+                orders.map(order => (
+                  <tr key={order.id} className="border-b border-gray-100 hover:bg-gray-50">
+                    <td className="py-3 px-4 text-sm">{order.id.substring(0, 8)}...</td>
+                    <td className="py-3 px-4 text-sm font-medium">{order.customerName}</td>
+                    <td className="py-3 px-4 text-sm">Rp {order.totalPrice.toLocaleString('id-ID')}</td>
+                    <td className="py-3 px-4 text-sm">
+                      <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
+                        order.status === 'Di Pesan' ? 'bg-blue-100 text-blue-800' :
+                        order.status === 'Di Proses' ? 'bg-yellow-100 text-yellow-800' :
+                        order.status === 'Siap Kirim' ? 'bg-purple-100 text-purple-800' :
+                        order.status === 'Di Kirim' ? 'bg-green-100 text-green-800' :
+                        'bg-gray-100 text-gray-800'
+                      }`}>
+                        {order.status}
+                      </span>
+                    </td>
+                    <td className="py-3 px-4 text-sm">{new Date(order.createdAt).toLocaleDateString('id-ID')}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Dasbor Processing (Pemotongan)
+const ProcessingDashboard = () => {
+  const { db, userId } = useContext(AppContext);
+  const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+  const [pendingOrders, setPendingOrders] = useState([]); // Orders 'Di Pesan' or 'Di Proses'
+  const [processedOrders, setProcessedOrders] = useState([]); // Orders 'Siap Kirim'
+  const [message, setMessage] = useState('');
+  const [selectedOrder, setSelectedOrder] = useState(null); // State untuk detail pesanan yang dipilih
+
+  useEffect(() => {
+    if (!db || !userId) return;
+
+    // Langganan pesanan yang statusnya 'Di Pesan' atau 'Di Proses'
+    const pendingOrdersRef = collection(db, `artifacts/${appId}/public/data/orders`);
+    const qPending = query(pendingOrdersRef, where('status', 'in', ['Di Pesan', 'Di Proses']));
+    const unsubscribePending = onSnapshot(qPending, (snapshot) => {
+      const fetchedOrders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setPendingOrders(fetchedOrders);
+    }, (error) => console.error("Error fetching pending processing orders:", error));
+
+    // Langganan pesanan yang statusnya 'Siap Kirim' (sudah dipotong)
+    const processedOrdersRef = collection(db, `artifacts/${appId}/public/data/orders`);
+    const qProcessed = query(processedOrdersRef, where('status', '==', 'Siap Kirim'));
+    const unsubscribeProcessed = onSnapshot(qProcessed, (snapshot) => {
+      const fetchedOrders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setProcessedOrders(fetchedOrders);
+    }, (error) => console.error("Error fetching processed orders:", error));
+
+
+    return () => {
+      unsubscribePending();
+      unsubscribeProcessed();
+    };
+  }, [db, userId, appId]);
+
+  const handleUpdateOrderStatus = async (orderId, newStatus) => {
+    try {
+      const orderDocRef = doc(db, `artifacts/${appId}/public/data/orders`, orderId);
+      await updateDoc(orderDocRef, { status: newStatus, updatedAt: Date.now() });
+      setMessage(`Status pesanan ${orderId.substring(0, 8)}... berhasil diubah menjadi ${newStatus}.`);
+      if (selectedOrder && selectedOrder.id === orderId) {
+        setSelectedOrder(prev => ({ ...prev, status: newStatus, updatedAt: Date.now() }));
+      }
+    } catch (error) {
+      console.error("Error updating order status:", error);
+      setMessage('Gagal memperbarui status pesanan.');
+    }
+  };
+
+  return (
+    <div className="bg-white p-6 rounded-xl shadow-lg m-4"> {/* Added margin */}
+      <h2 className="text-3xl font-bold text-blue-700 mb-6 border-b-2 pb-2 border-blue-200">Dasbor Prosesing (Pemotongan)</h2>
+
+      {message && (
+        <div className="bg-blue-100 text-blue-800 p-3 rounded-md mb-4 text-center">
+          {message}
+        </div>
+      )}
+
+      <h3 className="text-2xl font-semibold text-gray-700 mb-4">Pesanan untuk Diproses</h3>
+      <div className="overflow-x-auto mb-8">
+        <table className="min-w-full bg-white rounded-lg overflow-hidden shadow-md">
+          <thead className="bg-gray-100 border-b border-gray-200"><tr>
+              <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">ID Pesanan</th>
+              <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Pelanggan</th>
+              <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Status</th>
+              <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Aksi</th>
+            </tr></thead>
+          <tbody>
+            {pendingOrders.length === 0 ? (<tr>
+                <td colSpan="4" className="text-center py-4 text-gray-500">Tidak ada pesanan untuk diproses.</td>
+              </tr>) : (
+              pendingOrders.map(order => (
+                <tr key={order.id} className="border-b border-gray-100 hover:bg-gray-50">
+                  <td className="py-3 px-4 text-sm">
+                    <button
+                      onClick={() => setSelectedOrder(order)}
+                      className="text-blue-600 hover:underline font-medium"
+                    >
+                      {order.id.substring(0, 8)}...
+                    </button>
+                  </td>
+                  <td className="py-3 px-4 text-sm font-medium">{order.customerName}</td>
+                  <td className="py-3 px-4 text-sm">
+                    <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
+                      order.status === 'Di Pesan' ? 'bg-blue-100 text-blue-800' :
+                      order.status === 'Di Proses' ? 'bg-yellow-100 text-yellow-800' :
+                      'bg-gray-100 text-gray-800'
+                    }`}>
+                      {order.status}
+                    </span>
+                  </td>
+                  <td className="py-3 px-4 text-sm">
+                    {order.status === 'Di Pesan' && (
+                      <button
+                        onClick={() => handleUpdateOrderStatus(order.id, 'Di Proses')}
+                        className="bg-yellow-500 text-white py-1 px-3 rounded-full text-xs hover:bg-yellow-600 transition-colors duration-300 mr-2"
+                      >
+                        Mulai Proses
+                      </button>
+                    )}
+                    {order.status === 'Di Proses' && (
+                      <button
+                        onClick={() => handleUpdateOrderStatus(order.id, 'Siap Kirim')}
+                        className="bg-green-500 text-white py-1 px-3 rounded-full text-xs hover:bg-green-600 transition-colors duration-300"
+                      >
+                        Selesai Proses
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {selectedOrder && (
+        <div className="mt-8 p-6 bg-blue-50 rounded-lg shadow-inner border border-blue-200">
+          <div className="flex justify-between items-center mb-4">
+            <h3 className="text-2xl font-semibold text-blue-700">Detail Pesanan: {selectedOrder.id.substring(0, 8)}...</h3>
+            <button
+              onClick={() => setSelectedOrder(null)}
+              className="bg-gray-300 text-gray-800 py-1 px-4 rounded-full hover:bg-gray-400 transition-colors duration-300"
+            >
+              Tutup Detail
+            </button>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-gray-700">
+            <div>
+              <p className="font-medium">Nama Pelanggan:</p>
+              <p className="ml-2">{selectedOrder.customerName}</p>
+            </div>
+            <div>
+              <p className="font-medium">Alamat:</p>
+              <p className="ml-2">{selectedOrder.customerAddress || 'N/A'}</p>
+            </div>
+            <div>
+              <p className="font-medium">Nomor WA:</p>
+              <p className="ml-2">{selectedOrder.customerPhone || 'N/A'}</p>
+            </div>
+            <div>
+              <p className="font-medium">Total Harga:</p>
+              <p className="ml-2">Rp {selectedOrder.totalPrice.toLocaleString('id-ID')}</p>
+            </div>
+            <div className="md:col-span-2">
+              <p className="font-medium">Status Pesanan:</p>
+              <p className="ml-2">
+                <span className={`px-3 py-1 rounded-full text-sm font-semibold ${
+                  selectedOrder.status === 'Di Pesan' ? 'bg-blue-100 text-blue-800' :
+                  selectedOrder.status === 'Di Proses' ? 'bg-yellow-100 text-yellow-800' :
+                  selectedOrder.status === 'Siap Kirim' ? 'bg-purple-100 text-purple-800' :
+                  selectedOrder.status === 'Di Kirim' ? 'bg-green-100 text-green-800' :
+                  'bg-gray-100 text-gray-800'
+                }`}>
+                  {selectedOrder.status}
+                </span>
+              </p>
+            </div>
+            <div className="md:col-span-2">
+              <p className="font-medium mb-2">Item Pesanan:</p>
+              <ul className="list-disc list-inside bg-white p-4 rounded-md shadow-sm">
+                {selectedOrder.items.map((item, itemIndex) => (
+                  <li key={itemIndex} className="mb-1 text-gray-800">
+                    <span className="font-semibold">{item.productName}</span>: {item.quantity} {item.unit || 'unit'}
+                    (Rp {item.price.toLocaleString('id-ID')}/{item.unit || 'unit'})
+                  </li>
+                ))}
+              </ul>
+            </div>
+            {selectedOrder.orderNotes && ( // Display order notes if available
+              <div className="md:col-span-2">
+                <p className="font-medium">Catatan Pemesanan:</p>
+                <p className="ml-2 italic">{selectedOrder.orderNotes}</p>
+              </div>
+            )}
+            {selectedOrder.customerSignature && (
+              <div className="md:col-span-2">
+                <p className="font-medium">Tanda Tangan Pelanggan:</p>
+                <p className="ml-2 italic">{selectedOrder.customerSignature}</p>
+              </div>
+            )}
+            <div>
+              <p className="font-medium">Dibuat Pada:</p>
+              <p className="ml-2">{new Date(selectedOrder.createdAt).toLocaleDateString('id-ID')} {new Date(selectedOrder.createdAt).toLocaleTimeString('id-ID')}</p>
+            </div>
+            <div>
+              <p className="font-medium">Terakhir Diperbarui:</p>
+              <p className="ml-2">{new Date(selectedOrder.updatedAt).toLocaleDateString('id-ID')} {new Date(selectedOrder.updatedAt).toLocaleTimeString('id-ID')}</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* New: History Pemotongan Table */}
+      <h3 className="text-2xl font-semibold text-gray-700 mb-4 mt-8">Riwayat Pemotongan (Selesai)</h3>
+      <div className="overflow-x-auto">
+        <table className="min-w-full bg-white rounded-lg overflow-hidden shadow-md">
+          <thead className="bg-gray-100 border-b border-gray-200"><tr>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">ID Pesanan</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Pelanggan</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Total Harga</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Tanggal Selesai</th>
+          </tr></thead>
+          <tbody>
+            {processedOrders.length === 0 ? (<tr>
+              <td colSpan="4" className="text-center py-4 text-gray-500">Tidak ada riwayat pemotongan.</td>
+            </tr>) : (
+              processedOrders.map(order => (
+                <tr key={order.id} className="border-b border-gray-100 hover:bg-gray-50">
+                  <td className="py-3 px-4 text-sm">{order.id.substring(0, 8)}...</td>
+                  <td className="py-3 px-4 text-sm font-medium">{order.customerName}</td>
+                  <td className="py-3 px-4 text-sm">Rp {order.totalPrice.toLocaleString('id-ID')}</td>
+                  <td className="py-3 px-4 text-sm">{new Date(order.updatedAt).toLocaleDateString('id-ID')}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+// Dasbor Kurir
+const CourierDashboard = () => {
+  const { db, userId } = useContext(AppContext);
+  const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+  const [pendingOrders, setPendingOrders] = useState([]); // Orders ready for delivery or in transit
+  const [deliveredOrders, setDeliveredOrders] = useState([]); // Orders with 'Di Terima' status
+  const [couriers, setCouriers] = useState([]);
+  const [message, setMessage] = useState('');
+
+  useEffect(() => {
+    if (!db || !userId) return;
+
+    // Langganan pesanan yang statusnya 'Siap Kirim' atau 'Di Kirim'
+    const pendingOrdersRef = collection(db, `artifacts/${appId}/public/data/orders`);
+    const qPending = query(pendingOrdersRef, where('status', 'in', ['Siap Kirim', 'Di Kirim']));
+    const unsubscribePendingOrders = onSnapshot(qPending, (snapshot) => {
+      const fetchedOrders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setPendingOrders(fetchedOrders);
+    }, (error) => console.error("Error fetching pending courier orders:", error));
+
+    // Langganan pesanan yang statusnya 'Di Terima'
+    const deliveredOrdersRef = collection(db, `artifacts/${appId}/public/data/orders`);
+    const qDelivered = query(deliveredOrdersRef, where('status', '==', 'Di Terima'));
+    const unsubscribeDeliveredOrders = onSnapshot(qDelivered, (snapshot) => {
+      const fetchedOrders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setDeliveredOrders(fetchedOrders);
+    }, (error) => console.error("Error fetching delivered courier orders:", error));
+
+
+    // Langganan kurir dari koleksi publik
+    const usersPublicDataRef = collection(db, `artifacts/${appId}/public/data/users_public_data`);
+    const unsubscribeCouriers = onSnapshot(query(usersPublicDataRef, where('role', '==', 'kurir')), (snapshot) => {
+      const fetchedCouriers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setCouriers(fetchedCouriers);
+    }, (error) => console.error("Error fetching couriers:", error));
+
+    return () => {
+      unsubscribePendingOrders();
+      unsubscribeDeliveredOrders();
+      unsubscribeCouriers();
+    };
+  }, [db, userId, appId]);
+
+  const handleAssignCourier = async (orderId, courierId) => {
+    try {
+      const orderDocRef = doc(db, `artifacts/${appId}/public/data/orders`, orderId);
+      await updateDoc(orderDocRef, { assignedCourierId: courierId, updatedAt: Date.now() });
+      setMessage(`Pesanan ${orderId.substring(0, 8)}... berhasil ditugaskan ke kurir.`);
+    } catch (error) {
+      console.error("Error assigning courier:", error);
+      setMessage('Gagal menugaskan kurir.');
+    }
+  };
+
+  const handleUpdateOrderStatus = async (orderId, newStatus, orderItems, customerId, customerName, customerAddress, customerPhone) => {
+    try {
+      const orderDocRef = doc(db, `artifacts/${appId}/public/data/orders`, orderId);
+      const updateData = { status: newStatus, updatedAt: Date.now() };
+
+      if (newStatus === 'Di Terima') {
+        // Calculate total reward points from all items in the order
+        const totalRewardPointsEarned = orderItems.reduce((sum, item) => {
+          return sum + (item.quantity * (item.rewardPerUnit || Math.floor(item.price / 10000)));
+        }, 0);
+
+        // Update reward points for the customer
+        const customersRef = collection(db, `artifacts/${appId}/public/data/customers`);
+        let customerDocRef;
+
+        if (customerId) {
+          // If customerId exists, try to get existing customer document
+          customerDocRef = doc(customersRef, customerId);
+          const customerDocSnap = await getDoc(customerDocRef);
+          if (customerDocSnap.exists()) {
+            const currentPoints = customerDocSnap.data().rewardPoints || 0;
+            await updateDoc(customerDocRef, {
+              rewardPoints: currentPoints + totalRewardPointsEarned
+            });
+          } else {
+            // Customer ID exists but document doesn't (e.g., deleted or inconsistent data), create new
+            await setDoc(customerDocRef, {
+              customerName,
+              customerAddress,
+              customerPhone,
+              rewardPoints: totalRewardPointsEarned,
+              createdAt: Date.now()
+            });
+          }
+        } else {
+          // If no customerId, try to find by name/phone or create new
+          const q = query(customersRef, where('customerName', '==', customerName), where('customerPhone', '==', customerPhone));
+          const customerSnapshot = await getDocs(q);
+
+          if (!customerSnapshot.empty) {
+            customerDocRef = customerSnapshot.docs[0].ref;
+            const currentPoints = customerSnapshot.docs[0].data().rewardPoints || 0;
+            await updateDoc(customerDocRef, {
+              rewardPoints: currentPoints + totalRewardPointsEarned
+            });
+          } else {
+            customerDocRef = await addDoc(customersRef, {
+              customerName,
+              customerAddress,
+              customerPhone,
+              rewardPoints: totalRewardPointsEarned,
+              createdAt: Date.now()
+            });
+          }
+        }
+      }
+      await updateDoc(orderDocRef, updateData);
+      setMessage(`Status pesanan ${orderId.substring(0, 8)}... berhasil diubah menjadi ${newStatus}.`);
+    } catch (error) {
+      console.error("Error updating order status:", error);
+      setMessage('Gagal memperbarui status pesanan.');
+    }
+  };
+
+  return (
+    <div className="bg-white p-6 rounded-xl shadow-lg m-4"> {/* Added margin */}
+      <h2 className="text-3xl font-bold text-blue-700 mb-6 border-b-2 pb-2 border-blue-200">Dasbor Kurir</h2>
+
+      {message && (
+        <div className="bg-blue-100 text-blue-800 p-3 rounded-md mb-4 text-center">
+          {message}
+        </div>
+      )}
+
+      <h3 className="text-2xl font-semibold text-gray-700 mb-4">Pesanan Siap Kirim / Dalam Pengiriman</h3>
+      <div className="overflow-x-auto mb-8">
+        <table className="min-w-full bg-white rounded-lg overflow-hidden shadow-md">
+          <thead className="bg-gray-100 border-b border-gray-200"><tr>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">ID Pesanan</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Pelanggan</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Total Harga</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Alamat</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Nomor WA</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Status</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Kurir Ditugaskan</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Aksi</th>
+          </tr></thead>
+          <tbody>
+            {pendingOrders.length === 0 ? (<tr>
+              <td colSpan="8" className="text-center py-4 text-gray-500">Tidak ada pesanan untuk kurir.</td>
+            </tr>) : (
+              pendingOrders.map(order => (
+                <tr key={order.id} className="border-b border-gray-100 hover:bg-gray-50">
+                  <td className="py-3 px-4 text-sm">{order.id.substring(0, 8)}...</td>
+                  <td className="py-3 px-4 text-sm font-medium">{order.customerName}</td>
+                  <td className="py-3 px-4 text-sm">Rp {order.totalPrice.toLocaleString('id-ID')}</td>
+                  <td className="py-3 px-4 text-sm">{order.customerAddress || 'N/A'}</td>
+                  <td className="py-3 px-4 text-sm">{order.customerPhone || 'N/A'}</td>
+                  <td className="py-3 px-4 text-sm">
+                    <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
+                      order.status === 'Siap Kirim' ? 'bg-purple-100 text-purple-800' :
+                      order.status === 'Di Kirim' ? 'bg-green-100 text-green-800' :
+                      order.status === 'Di Terima' ? 'bg-indigo-100 text-indigo-800' :
+                      'bg-gray-100 text-gray-800'
+                    }`}>
+                      {order.status}
+                    </span>
+                  </td>
+                  <td className="py-3 px-4 text-sm">
+                    {order.assignedCourierId ? (
+                      couriers.find(c => c.id === order.assignedCourierId)?.name || 'Tidak Dikenal'
+                    ) : (
+                      <select
+                        className="rounded-md border-gray-300 shadow-sm p-1 text-sm"
+                        onChange={(e) => handleAssignCourier(order.id, e.target.value)}
+                        value={''} // Default to empty to force selection
+                      >
+                        <option value="">Pilih Kurir</option>
+                        {couriers.filter(c => !pendingOrders.some(o => o.assignedCourierId === c.id && o.id !== order.id)).map(courier => (
+                          <option key={courier.id} value={courier.id}>{courier.name}</option>
+                        ))}
+                      </select>
+                    )}
+                  </td>
+                  <td className="py-3 px-4 text-sm">
+                    {order.status === 'Siap Kirim' && order.assignedCourierId && (
+                      <button
+                        onClick={() => handleUpdateOrderStatus(order.id, 'Di Kirim', order.items, order.customerId, order.customerName, order.customerAddress, order.customerPhone)}
+                        className="bg-green-500 text-white py-1 px-3 rounded-full text-xs hover:bg-green-600 transition-colors duration-300 mr-2"
+                      >
+                        Mulai Kirim
+                      </button>
+                    )}
+                    {order.status === 'Di Kirim' && (
+                      <button
+                        onClick={() => handleUpdateOrderStatus(order.id, 'Di Terima', order.items, order.customerId, order.customerName, order.customerAddress, order.customerPhone)}
+                        className="bg-purple-500 text-white py-1 px-3 rounded-full text-xs hover:bg-purple-600 transition-colors duration-300 mr-2"
+                      >
+                        Selesai
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <h3 className="text-2xl font-semibold text-gray-700 mb-4 mt-8">Riwayat Pengiriman (Selesai)</h3>
+      <div className="overflow-x-auto">
+        <table className="min-w-full bg-white rounded-lg overflow-hidden shadow-md">
+          <thead className="bg-gray-100 border-b border-gray-200"><tr>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">ID Pesanan</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Pelanggan</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Total Harga</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Alamat</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Nomor WA</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Kurir</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Tanggal Diterima</th>
+          </tr></thead>
+          <tbody>
+            {deliveredOrders.length === 0 ? (<tr>
+              <td colSpan="7" className="text-center py-4 text-gray-500">Tidak ada riwayat pengiriman.</td>
+            </tr>) : (
+              deliveredOrders.map(order => (
+                <tr key={order.id} className="border-b border-gray-100 hover:bg-gray-50">
+                  <td className="py-3 px-4 text-sm">{order.id.substring(0, 8)}...</td>
+                  <td className="py-3 px-4 text-sm font-medium">{order.customerName}</td>
+                  <td className="py-3 px-4 text-sm">Rp {order.totalPrice.toLocaleString('id-ID')}</td>
+                  <td className="py-3 px-4 text-sm">{order.customerAddress || 'N/A'}</td>
+                  <td className="py-3 px-4 text-sm">{order.customerPhone || 'N/A'}</td>
+                  <td className="py-3 px-4 text-sm">{couriers.find(c => c.id === order.assignedCourierId)?.name || 'Tidak Dikenal'}</td>
+                  <td className="py-3 px-4 text-sm">{new Date(order.updatedAt).toLocaleDateString('id-ID')}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+// Komponen Manajemen Karyawan (Digunakan di Owner Dashboard)
+const EmployeeManagement = ({ users }) => {
+  const { db } = useContext(AppContext);
+  const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+  const [newUserName, setNewUserName] = useState('');
+  const [newUserRole, setNewUserRole] = useState('marketing');
+  const [message, setMessage] = useState('');
+
+  const handleAddEmployee = async (e) => {
+    e.preventDefault();
+    if (!newUserName) {
+      setMessage('Nama karyawan tidak boleh kosong.');
+      return;
+    }
+    try {
+      const newUserId = crypto.randomUUID(); // Generate a new UUID for the user
+      // Only create public record; private profile will be created on first login of the new user
+      const publicUserRef = doc(db, `artifacts/${appId}/public/data/users_public_data`, newUserId);
+      await setDoc(publicUserRef, { id: newUserId, name: newUserName, role: newUserRole });
+
+      setMessage('Karyawan berhasil ditambahkan!');
+      setNewUserName('');
+    } catch (error) {
+      console.error("Error adding employee:", error);
+      setMessage('Gagal menambahkan karyawan.');
+    }
+  };
+
+  const handleChangeEmployeeRole = async (employeeId, newRole) => {
+    try {
+      // Only update public record; private profile will be updated on next login of the user
+      const publicUserRef = doc(db, `artifacts/${appId}/public/data/users_public_data`, employeeId);
+      await updateDoc(publicUserRef, { role: newRole });
+
+      setMessage(`Peran karyawan ${employeeId.substring(0, 8)}... berhasil diubah menjadi ${newRole}.`);
+    } catch (error) {
+      console.error("Error changing employee role:", error);
+      setMessage('Gagal mengubah peran karyawan.');
+    }
+  };
+
+  const handleDeleteEmployee = async (employeeId) => {
+    if (window.confirm('Apakah Anda yakin ingin menghapus karyawan ini?')) {
+      try {
+        // Only delete public record; private profile remains but user won't appear in public list
+        const publicUserRef = doc(db, `artifacts/${appId}/public/data/users_public_data`, employeeId);
+        await deleteDoc(publicUserRef);
+
+        setMessage(`Karyawan ${employeeId.substring(0, 8)}... berhasil dihapus.`);
+      } catch (error) {
+        console.error("Error deleting employee:", error);
+        setMessage('Gagal menghapus karyawan.');
+      }
+    }
+  };
+
+  return (
+    <div className="p-6 bg-gray-50 rounded-lg shadow-inner">
+      <h3 className="text-2xl font-semibold text-gray-700 mb-4">Manajemen Karyawan</h3>
+
+      {message && (
+        <div className="bg-blue-100 text-blue-800 p-3 rounded-md mb-4 text-center">
+          {message}
+        </div>
+      )}
+
+      <form onSubmit={handleAddEmployee} className="mb-6 grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
+        <div>
+          <label htmlFor="newUserName" className="block text-sm font-medium text-gray-700">Nama Karyawan Baru</label>
+          <input
+            type="text"
+            id="newUserName"
+            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"
+            value={newUserName}
+            onChange={(e) => setNewUserName(e.target.value)}
+            required
+          />
+        </div>
+        <div>
+          <label htmlFor="newUserRole" className="block text-sm font-medium text-gray-700">Peran</label>
+          <select
+            id="newUserRole"
+            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"
+            value={newUserRole}
+            onChange={(e) => setNewUserRole(e.target.value)}
+          >
+            <option value="marketing">Marketing</option>
+            <option value="pemotong">Pemotong</option>
+            <option value="kurir">Kurir</option>
+            <option value="owner">Owner</option>
+          </select>
+        </div>
+        <div>
+          <button type="submit" className="bg-blue-500 text-white py-2 px-6 rounded-full hover:bg-blue-600 transition-colors duration-300 shadow-md w-full">
+            Tambah Karyawan
+          </button>
+        </div>
+      </form>
+
+      <h4 className="text-xl font-semibold text-gray-600 mb-3">Daftar Karyawan</h4>
+      <div className="overflow-x-auto">
+        <table className="min-w-full bg-white rounded-lg overflow-hidden shadow-md">
+          <thead className="bg-gray-100 border-b border-gray-200"><tr>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">ID Karyawan</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Nama</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Peran</th>
+            <th className="py-3 px-4 text-left text-sm font-medium text-gray-600">Aksi</th>
+          </tr></thead>
+          <tbody>
+            {users.length === 0 ? (<tr>
+              <td colSpan="4" className="text-center py-4 text-gray-500">Tidak ada karyawan.</td>
+            </tr>) : (
+              users.map(user => (
+                <tr key={user.id} className="border-b border-gray-100 hover:bg-gray-50">
+                  <td className="py-3 px-4 text-sm">{user.id.substring(0, 8)}...</td>
+                  <td className="py-3 px-4 text-sm font-medium">{user.name}</td>
+                  <td className="py-3 px-4 text-sm">
+                    <select
+                      className="rounded-md border-gray-300 shadow-sm p-1 text-sm"
+                      value={user.role}
+                      onChange={(e) => handleChangeEmployeeRole(user.id, e.target.value)}
+                    >
+                      <option value="marketing">Marketing</option>
+                      <option value="pemotong">Pemotong</option>
+                      <option value="kurir">Kurir</option>
+                      <option value="owner">Owner</option>
+                    </select>
+                  </td>
+                  <td className="py-3 px-4 text-sm">
+                    <button
+                      onClick={() => handleDeleteEmployee(user.id)}
+                      className="bg-red-500 text-white py-1 px-3 rounded-full text-xs hover:bg-red-600 transition-colors duration-300"
+                    >
+                      Hapus
+                    </button>
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+export default App;
